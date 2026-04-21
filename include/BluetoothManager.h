@@ -1,82 +1,52 @@
-/*
-================================================================================
-BLUETOOTH MANAGER OBJECT (V3 - Autonomous)
-================================================================================
-Назначение:
------------
-Автономный объект управления Bluetooth Serial и LED-индикацией.
-Наследуется от SystemObject, работает в собственной задаче FreeRTOS.
-
-Функционал:
------------
-1. Автономный прием/передача данных (не требует вызовов из loop)
-2. LED-индикация состояния:
-   - Горит: Подключение активно
-   - Мигает 5 раз: Подключение разорвано
-   - Погас: После 5 миганий (ожидание переподключения)
-3. Потокобезопасный доступ к данным (Mutex)
-4. Автоматическая очистка ресурсов при остановке
-
-Архитектура:
-------------
-[ SystemObject ]
-       ^
-       |
-[ BluetoothManager ] -> [ BluetoothSerial ]
-                      -> [ LED Driver ]
-================================================================================
-*/
-
 #ifndef BLUETOOTH_MANAGER_H
 #define BLUETOOTH_MANAGER_H
 
-#include "SystemObject.h"
+#include "types.h"      // ПЕРВЫМ!
+#include "BaseObject.h"
 #include <BluetoothSerial.h>
-#include "freertos/semphr.h"
+#include "debug.h"
 
-// Конфигурация
-#define BT_LED_PIN           2
-#define BT_DEVICE_NAME       "Car Monitor"
-#define BLINK_INTERVAL_MS    300
-#define BLINK_COUNT_TARGET   5
+#define BT_LED_PIN             2
+#define BT_DEFAULT_DEVICE_NAME "Car Monitor V3"
+#define BT_LED_BLINK_INTERVAL  300
+#define BT_LED_BLINK_COUNT     5
+#define BT_OUT_QUEUE_DEPTH     1
 
-class BluetoothManager : public SystemObject {
+class BluetoothManager : public BaseObject {
 public:
     BluetoothManager();
     ~BluetoothManager();
 
-    // Переопределение метода запуска (доп. инициализация)
-    bool start(const char* deviceName = BT_DEVICE_NAME);
-
-    // Методы для обмена данными (вызываются из других задач)
-    int available();
-    int read();
-    size_t write(const uint8_t* buffer, size_t size);
+    // init() — НЕ override (своя сигнатура)
+    bool init(const char* deviceName = BT_DEFAULT_DEVICE_NAME);
     
-    // Статус соединения
-    bool isConnected();
+    // stop() — override (совпадает с BaseObject)
+    void stop() override;
+
+    QueueHandle_t getOutQueue() const { return _outQueue; }
+    void setRxTarget(QueueHandle_t queue) { _rxTarget = queue; }
+    bool isConnected() const { return _isConnected; }
 
 protected:
-    // Основной цикл задачи (обязательный метод SystemObject)
-    void taskLoop() override;
+    void process() override;
+    void onCommand(Command cmd) override;
 
 private:
     BluetoothSerial _bt;
-    SemaphoreHandle_t _mutex;
-    
-    // Состояние соединения
+    QueueHandle_t _outQueue;   // ВЛАДЕЕМ
+    QueueHandle_t _rxTarget;   // ССЫЛКА (только запись)
+
     bool _isConnected;
-    
-    // Логика LED
     uint32_t _lastBlinkTime;
     uint8_t _blinkCount;
     bool _ledState;
     bool _blinkSequenceActive;
 
-    // Внутренняя логика
     void _updateLed();
     void _handleConnectionChange(bool currentState);
     void _setLed(bool state);
+    void _processTx();
+    void _processRx();
 };
 
 #endif // BLUETOOTH_MANAGER_H

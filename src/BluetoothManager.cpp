@@ -1,132 +1,117 @@
-/*
-================================================================================
-BLUETOOTH MANAGER IMPLEMENTATION
-================================================================================
-*/
-
 #include "BluetoothManager.h"
 
 BluetoothManager::BluetoothManager() 
-    : SystemObject("BT_Manager", 5, 4096) // Имя, Приоритет, Стек
+    : BaseObject("BT_Manager", 5, 4096, 0)
+    , _outQueue(nullptr)
+    , _rxTarget(nullptr)
     , _isConnected(false)
     , _lastBlinkTime(0)
     , _blinkCount(0)
     , _ledState(false)
     , _blinkSequenceActive(false)
 {
-    _mutex = xSemaphoreCreateMutex();
     pinMode(BT_LED_PIN, OUTPUT);
     _setLed(false);
 }
 
 BluetoothManager::~BluetoothManager() {
-    if (_mutex) vSemaphoreDelete(_mutex);
+    if (_outQueue) vQueueDelete(_outQueue);
     _setLed(false);
 }
 
-bool BluetoothManager::start(const char* deviceName) {
-    // Инициализация Bluetooth перед запуском задачи
+bool BluetoothManager::init(const char* deviceName) {
     if (!_bt.begin(deviceName)) {
-        Serial.println("[BT] Hardware init failed");
-        _state = STATE_ERROR;
+        DBG_PRINTLN("[BT] HW init failed");
+        _state = ObjectState::STATE_ERROR;
         return false;
     }
-    Serial.printf("[BT] Initialized: %s\n", deviceName);
-    
-    // Запуск задачи базового класса
-    return SystemObject::start();
+    _outQueue = xQueueCreate(BT_OUT_QUEUE_DEPTH, sizeof(BtOutMessage));
+    if (!_outQueue) {
+        DBG_PRINTLN("[BT] Queue creation failed");
+        _state = ObjectState::STATE_ERROR;
+        return false;
+    }
+    return BaseObject::start();
 }
 
-void BluetoothManager::taskLoop() {
-    // Бесконечный цикл задачи
-    while (_state == STATE_RUNNING) {
-        // 1. Проверка соединения
-        bool currentConnection = _bt.hasClient();
-        if (currentConnection != _isConnected) {
-            _handleConnectionChange(currentConnection);
+void BluetoothManager::stop() {
+    DBG_PRINTLN("[BT] Stopping...");
+    BaseObject::stop();
+    if (_outQueue) {
+        vQueueDelete(_outQueue);
+        _outQueue = nullptr;
+    }
+    _setLed(false);
+}
+
+void BluetoothManager::process() {
+    bool current = _bt.hasClient();
+    if (current != _isConnected) _handleConnectionChange(current);
+    _updateLed();
+    _processTx();
+    _processRx();
+}
+
+void BluetoothManager::onCommand(Command cmd) {
+    if (cmd == Command::CMD_OTA_START) DBG_PRINTLN("[BT] OTA requested");
+    else BaseObject::onCommand(cmd);
+}
+
+void BluetoothManager::_processTx() {
+    BtOutMessage msg;
+    if (xQueueReceive(_outQueue, &msg, 0) == pdTRUE) {
+        _bt.write((uint8_t*)msg.data, msg.len);
+    }
+}
+
+void BluetoothManager::_processRx() {
+    static char buf[128];
+    static uint16_t pos = 0;
+    while (_bt.available()) {
+        char c = _bt.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+            if (_rxTarget && pos > 0) {
+                ProtocolInMessage pMsg;
+                uint16_t len = (pos < sizeof(pMsg.payload)-1) ? pos : (sizeof(pMsg.payload)-1);
+                pMsg.len = len;
+                memcpy(pMsg.payload, buf, len);
+                pMsg.payload[len] = '\0';
+                xQueueOverwrite(_rxTarget, &pMsg);
+            }
+            pos = 0;
+        } else {
+            if (pos < sizeof(buf)-1) buf[pos++] = c;
+            else pos = 0;
         }
-
-        // 2. Обновление LED (всегда работает, даже без соединения)
-        _updateLed();
-
-        // 3. Небольшая задержка для стабильности
-        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
 void BluetoothManager::_handleConnectionChange(bool currentState) {
     _isConnected = currentState;
-    
     if (_isConnected) {
-        Serial.println("[BT] Connected");
-        _blinkSequenceActive = false;
-        _blinkCount = 0;
-        _setLed(true); // Горит постоянно
+        DBG_PRINTLN("[BT] Connected");
+        _blinkSequenceActive = false; _blinkCount = 0; _setLed(true);
     } else {
-        Serial.println("[BT] Disconnected");
-        _blinkSequenceActive = true;
-        _blinkCount = 0;
-        _lastBlinkTime = millis();
-        _setLed(false);
+        DBG_PRINTLN("[BT] Disconnected");
+        _blinkSequenceActive = true; _blinkCount = 0; _lastBlinkTime = millis(); _setLed(false);
     }
 }
 
 void BluetoothManager::_updateLed() {
-    if (_isConnected) {
-        return; // Если подключено - LED горит, логика не нужна
-    }
-
-    if (!_blinkSequenceActive) {
-        _setLed(false);
-        return;
-    }
-
+    if (_isConnected) return;
+    if (!_blinkSequenceActive) { _setLed(false); return; }
     uint32_t now = millis();
-    if (now - _lastBlinkTime >= BLINK_INTERVAL_MS) {
+    if (now - _lastBlinkTime >= BT_LED_BLINK_INTERVAL) {
         _lastBlinkTime = now;
-
-        if (_blinkCount < BLINK_COUNT_TARGET) {
-            _ledState = !_ledState;
-            _setLed(_ledState);
-            
-            // Считаем только включения для подсчета "вспышек"
-            if (_ledState) {
-                _blinkCount++;
-            }
-        } else {
-            // Лимит исчерпан
-            _blinkSequenceActive = false;
-            _setLed(false); // Погаснуть окончательно
-        }
+        if (_blinkCount < BT_LED_BLINK_COUNT) {
+            _ledState = !_ledState; _setLed(_ledState);
+            if (_ledState) _blinkCount++;
+        } else { _blinkSequenceActive = false; _setLed(false); }
     }
 }
 
 void BluetoothManager::_setLed(bool state) {
     _ledState = state;
     digitalWrite(BT_LED_PIN, state ? HIGH : LOW);
-}
-
-// --- Потокобезопасные методы доступа ---
-
-int BluetoothManager::available() {
-    // В простой реализации можно без мьютекса, т.к. read атомарен
-    return _bt.available();
-}
-
-int BluetoothManager::read() {
-    return _bt.read();
-}
-
-size_t BluetoothManager::write(const uint8_t* buffer, size_t size) {
-    // Защита записи от одновременного доступа
-    if (xSemaphoreTake(_mutex, portMAX_DELAY) == pdTRUE) {
-        size_t sent = _bt.write(buffer, size);
-        xSemaphoreGive(_mutex);
-        return sent;
-    }
-    return 0;
-}
-
-bool BluetoothManager::isConnected() {
-    return _isConnected;
 }
