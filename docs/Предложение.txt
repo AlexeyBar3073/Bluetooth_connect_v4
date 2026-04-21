@@ -1,0 +1,212 @@
+Я предлагаю поработать не над частными вопросами, просто пытаясь потушить пожар, а поработать над новой концепцией, которая могла бы легко реализовать оба сценария:
+1.Обычный режим работы в роутерной схеме
+2.Ota-режим с максимальным освобождением памяти
+
+Для начала структурно в виде схемы:
+Какие модули предполагается создать, кто за что буудет отвечать, как будет происходить переключение между сценариями
+
+Правильный заход — не латать режимы, а собрать систему, где режимы — это разные конфигурации одного ядра, а не два разных “мира”.
+
+Ниже — концепция v4, где:
+
+Router живёт в NORMAL
+OTA — это специальный runtime-профиль
+переключение — контролируемое и детерминированное
+🧠 1. Главная идея
+
+Не:
+
+Router vs No Router
+
+А:
+
+System Core + Runtime Profiles
+✔ Есть единое ядро
+SystemCore
+ ├── Transport Layer
+ ├── Message Layer (Framing)
+ ├── Execution Layer
+✔ И два профиля выполнения
+NORMAL PROFILE
+OTA PROFILE
+🧩 2. Модульная структура
+🔹 1. System Controller (главный модуль)
+[SystemController]
+Отвечает за:
+запуск системы
+переключение режимов
+lifecycle (init / stop / reboot)
+🔹 2. Resource Manager
+[ResourceManager]
+Отвечает за:
+heap анализ
+выделение буферов
+контроль fragmentation
+предоставление конфигураций
+🔹 3. Transport Layer
+[TransportManager]
+   ├── BT Transport
+   ├── (в будущем WiFi / UART)
+Отвечает за:
+RX/TX байтов
+НЕ знает про JSON
+НЕ знает про Router
+🔹 4. Message Layer (ключевой слой)
+[MessageFramer]
+Отвечает за:
+сборку сообщений (\n)
+гарантию целостности
+backpressure (drop whole message)
+
+👉 ЭТО ОБЯЗАТЕЛЬНЫЙ СЛОЙ В ОБОИХ РЕЖИМАХ
+
+🔹 5. Execution Layer (меняется по режиму)
+✔ NORMAL MODE
+[Router]
+   ├── Protocol (JSON)
+   ├── Modules (Climate, Calc, etc.)
+✔ OTA MODE
+[OTA Engine]
+
+👉 Router отсутствует
+👉 Protocol отсутствует
+
+🔹 6. OTA Engine
+[OTA Engine]
+   ├── JSON parser
+   ├── Chunk validator (CRC)
+   ├── Flash writer
+🧭 3. Общая схема
+🔹 NORMAL MODE
+        +------------------+
+        | SystemController |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | TransportManager |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | MessageFramer    |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | Router           |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | Modules          |
+🔹 OTA MODE
+        +------------------+
+        | SystemController |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | TransportManager |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | MessageFramer    |
+        +--------+---------+
+                 |
+        +--------v---------+
+        | OTA Engine       |
+🔄 4. Переключение режимов (ключевой процесс)
+✔ Шаги перехода NORMAL → OTA
+1. Получили CMD_OTA_START (через Router)
+
+2. SystemController:
+   ├── stop Router
+   ├── stop Protocol
+   ├── stop Modules
+   ├── clear queues
+
+3. ResourceManager:
+   ├── анализ heap
+   ├── расчет буферов
+
+4. TransportManager:
+   ├── restart BT transport (OTA config)
+
+5. MessageFramer:
+   ├── переключение на OTA limits (большие сообщения)
+
+6. Запуск OTA Engine
+
+7. Система переходит в single-purpose режим
+✔ Завершение OTA
+OTA Engine → success/fail
+        ↓
+SystemController → reboot
+⚙️ 5. Конфигурация через Profiles
+🔹 RuntimeProfile
+struct RuntimeProfile {
+    size_t msgMaxSize;
+    size_t ringBufferSize;
+    bool   useRouter;
+    bool   useProtocol;
+};
+✔ NORMAL
+msgMaxSize = 256–512
+ringBuffer = 1–2 KB
+useRouter  = true
+✔ OTA
+msgMaxSize = 2–4 KB
+ringBuffer = 8–32 KB
+useRouter  = false
+🔥 6. Ключевые архитектурные решения
+1. Framer — единый для всех режимов
+
+👉 убирает дублирование
+👉 гарантирует целостность
+
+2. Transport — тупой
+
+👉 только байты
+👉 никаких JSON
+
+3. Router — подключаемый модуль
+
+👉 не “ядро системы”, а плагин
+
+4. OTA Engine — отдельный pipeline
+
+👉 не зависит от Router
+
+5. SystemController — единственная точка управления
+
+👉 никакой самодеятельности модулей
+
+⚠️ 7. Где обычно делают ошибку
+❌ Ошибка 1
+
+“в OTA просто отключим куски”
+
+👉 приводит к мусору в памяти
+
+❌ Ошибка 2
+
+“транспорт пусть сам всё решает”
+
+👉 смешение уровней
+
+❌ Ошибка 3
+
+“Router пусть живёт всегда”
+
+👉 потеря RAM и скорости
+
+✔ 8. Что ты получаешь
+NORMAL
+масштабируемость
+модульность
+отсутствие гонок
+OTA
+максимум памяти
+максимальная скорость
+минимальная архитектура
+🚀 Итог
+
+Ты строишь не “две системы”, а:
+
+Один движок + два режима исполнения
