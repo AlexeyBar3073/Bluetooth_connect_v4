@@ -1,9 +1,21 @@
-#include "ProtocolManager.h"
+/*
+================================================================================
+PROTOCOLMANAGER.CPP — РЕАЛИЗАЦИЯ МЕНЕДЖЕРА ПРОТОКОЛА
+================================================================================
+*/
 
-ProtocolManager::ProtocolManager()
-    : BaseObject("Protocol", PROTOCOL_TASK_PRIORITY, PROTOCOL_TASK_STACK)
+#include "ProtocolManager.h"
+#include "DataRouter.h"
+
+
+// ============================================================================
+// КОНСТРУКТОР / ДЕСТРУКТОР
+// ============================================================================
+
+ProtocolManager::ProtocolManager(const char* name, UBaseType_t priority, 
+                                 uint32_t stackSize, BaseType_t core)
+    : BaseObject(name, priority, stackSize, core)
     , _inQueue(nullptr)
-    , _btOutQueue(nullptr)
     , _jsonMutex(nullptr)
     , _cmdCallback(nullptr)
     , _processedCount(0)
@@ -11,78 +23,183 @@ ProtocolManager::ProtocolManager()
 {}
 
 ProtocolManager::~ProtocolManager() {
-    if (_inQueue) vQueueDelete(_inQueue);
-    if (_jsonMutex) vSemaphoreDelete(_jsonMutex);
+    if (_inQueue) {
+        vQueueDelete(_inQueue);
+        _inQueue = nullptr;
+    }
+    if (_jsonMutex) {
+        vSemaphoreDelete(_jsonMutex);
+        _jsonMutex = nullptr;
+    }
 }
 
+// ============================================================================
+// УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ
+// ============================================================================
+
 bool ProtocolManager::start() {
+    DBG_PRINTLN("[PROTOCOL] Starting...");
+    
     _inQueue = xQueueCreate(PROTOCOL_QUEUE_DEPTH, sizeof(ProtocolInMessage));
-    _jsonMutex = xSemaphoreCreateMutex();
-    if (!_inQueue || !_jsonMutex) {
-        DBG_PRINTLN("[PROTOCOL] Resource creation failed");
+    if (!_inQueue) {
+        DBG_PRINTLN("[PROTOCOL] ERROR: Input queue creation failed");
         _state = ObjectState::STATE_ERROR;
         return false;
     }
+    DBG_PRINTF("[PROTOCOL] Input queue created (depth=%d, msg_size=%u)", 
+               PROTOCOL_QUEUE_DEPTH, (unsigned)sizeof(ProtocolInMessage));
+    
+    _jsonMutex = xSemaphoreCreateMutex();
+    if (!_jsonMutex) {
+        DBG_PRINTLN("[PROTOCOL] ERROR: Mutex creation failed");
+        vQueueDelete(_inQueue);
+        _inQueue = nullptr;
+        _state = ObjectState::STATE_ERROR;
+        return false;
+    }
+    DBG_PRINTLN("[PROTOCOL] JSON mutex created");
+    
     return BaseObject::start();
 }
 
 void ProtocolManager::stop() {
     DBG_PRINTLN("[PROTOCOL] Stopping...");
     BaseObject::stop();
-    if (_inQueue) { vQueueDelete(_inQueue); _inQueue = nullptr; }
-    if (_jsonMutex) { vSemaphoreDelete(_jsonMutex); _jsonMutex = nullptr; }
+    if (_inQueue) {
+        vQueueDelete(_inQueue);
+        _inQueue = nullptr;
+    }
+    if (_jsonMutex) {
+        vSemaphoreDelete(_jsonMutex);
+        _jsonMutex = nullptr;
+    }
 }
 
-void ProtocolManager::process() {
-    _processIncoming();
-}
+// ============================================================================
+// ОТПРАВКА ОТВЕТОВ
+// ============================================================================
 
-void ProtocolManager::onCommand(Command cmd) {
-    if (cmd == Command::CMD_OTA_START) DBG_PRINTLN("[PROTOCOL] OTA requested");
-    else BaseObject::onCommand(cmd);
-}
-
-bool ProtocolManager::sendResponse(Command cmd, ResponseStatus status, const char* data) {
-    if (!_btOutQueue) return false;
+void ProtocolManager::sendResponse(Command cmd, ResponseStatus status, const char* data) {
     JsonDocument doc;
     doc["cmd"] = static_cast<uint8_t>(cmd);
     doc["status"] = static_cast<uint8_t>(status);
-    if (data) doc["data"] = data;
-    char buf[256];
-    size_t len = serializeJson(doc, buf);
-    if (len > 0 && len < sizeof(buf)) {
-        _pushToPeer(buf);
-        return true;
+    if (data) {
+        doc["data"] = data;
     }
-    _errorCount++;
-    return false;
-}
-
-void ProtocolManager::setCommandCallback(ProtocolCommandCallback callback) {
-    _cmdCallback = callback;
-}
-
-void ProtocolManager::_processIncoming() {
-    ProtocolInMessage msg;
-    if (xQueueReceive(_inQueue, &msg, 0) != pdTRUE) return;
-    if (xSemaphoreTake(_jsonMutex, 10/portTICK_PERIOD_MS) != pdTRUE) return;
-    JsonDocument doc;
-    if (!deserializeJson(doc, msg.payload) && doc["cmd"].is<uint8_t>()) {
-        Command cmd = static_cast<Command>(doc["cmd"].as<uint8_t>());
-        DBG_PRINTF("[PROTOCOL] CMD: 0x%02X", static_cast<uint8_t>(cmd));
-        if (_cmdCallback) _cmdCallback(cmd, msg.payload);
-        _processedCount++;
+    
+    char buf[512];
+    size_t len = serializeJson(doc, buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) {
+        buf[len] = '\0';
+        _sendToBluetooth(buf);
     } else {
         _errorCount++;
+        DBG_PRINTLN("[PROTOCOL] ERROR: Response too large");
     }
-    xSemaphoreGive(_jsonMutex);
 }
 
-void ProtocolManager::_pushToPeer(const char* jsonStr) {
-    BtOutMessage outMsg;
-    size_t len = strlen(jsonStr);
-    if (len >= sizeof(outMsg.data)) return;
-    outMsg.len = len;
-    memcpy(outMsg.data, jsonStr, len + 1);
-    xQueueOverwrite(_btOutQueue, &outMsg);
+// ============================================================================
+// ХУКИ БАЗОВОГО КЛАССА
+// ============================================================================
+
+void ProtocolManager::process() {
+    //--- Обработка очереди входящих сообщений
+    _readIncomingQueue(); 
+}
+
+//--- Обработчик команд
+void ProtocolManager::onCommand(Command cmd) {
+   
+}
+
+// ============================================================================
+// ОБРАБОТЧИК СООБЩЕНИЙ
+// ============================================================================
+
+void ProtocolManager::onMessage(const char *msg)
+{
+    //--- Идентификатор входящего сообщения
+    static int msgId = 0;
+
+    //--- Идентификатор команды
+    Command cmd = Command::CMD_NONE;
+
+    //--- Десериализуем входящее сообщение
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, msg);
+    if (error) {
+        DBG_PRINTF("[PROTOCOL] ERROR: Failed to parse JSON: %s", error.c_str());
+        return;
+    }
+
+    //--- Получаем идентификатор входящего сообщения
+    msgId = (int)doc["msg_id"];
+
+    //--- Готовоим объект для ответа
+    JsonDocument resp;
+    //--- Если идентификатор входящей команды не равен 0, тогда отвечаем
+    if (msgId != 0)
+    {
+        resp["ack_id"] = msgId;
+        msgId = 0;
+    }
+
+    //--- Получаем идентификатор команды
+    const char *cmdStr = doc["command"];
+    cmd = (Command)_stringToCommand(cmdStr);
+    if (cmd != Command::CMD_NONE)
+    {
+        onCommand(cmd); // Вызываем обработчик
+    }
+}
+
+// ============================================================================
+// ВНУТРЕННИЕ МЕТОДЫ
+// ============================================================================
+
+void ProtocolManager::_readIncomingQueue() {
+    ProtocolInMessage msg;
+    
+    // Неблокирующее чтение
+    if (xQueueReceive(_inQueue, &msg, 0) != pdTRUE) {
+        return;
+    }
+    
+    // Захватываем мьютекс только на время копирования
+    if (xSemaphoreTake(_jsonMutex, 10 / portTICK_PERIOD_MS) != pdTRUE) {
+        return;
+    }
+    
+    char localBuffer[sizeof(msg.payload)];
+    strncpy(localBuffer, msg.payload, sizeof(localBuffer) - 1);
+    localBuffer[sizeof(localBuffer) - 1] = '\0';
+    
+    // Освобождаем мьютекс — очередь свободна
+    xSemaphoreGive(_jsonMutex);
+    
+    // Вызываем обработчик
+    onMessage(localBuffer);
+}
+
+void ProtocolManager::_sendToBluetooth(const char* json) {
+    BtOutMessage msg;
+    uint16_t len = strlen(json);
+    if (len >= sizeof(msg.data)) len = sizeof(msg.data) - 1;
+    
+    msg.len = len;
+    memcpy(msg.data, json, len);
+    msg.data[len] = '\0';
+    
+    DataRouter::publish(Topic::MSG_OUTGOING, &msg);
+}
+
+Command ProtocolManager::_stringToCommand(const char* str) {
+    if (!str) return Command::CMD_NONE;
+    
+    for (const auto& item : COMMAND_TABLE) {
+        if (strcmp(str, item.str) == 0) {
+            return item.cmd;
+        }
+    }
+    return Command::CMD_NONE;
 }

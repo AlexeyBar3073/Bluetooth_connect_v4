@@ -1,47 +1,123 @@
+/*
+================================================================================
+PROTOCOLMANAGER.H — МЕНЕДЖЕР ПРОТОКОЛА
+================================================================================
+
+НАЗНАЧЕНИЕ:
+-----------
+Обрабатывает входящие JSON-сообщения и команды управления. Работает в отдельной
+задаче FreeRTOS.
+
+АРХИТЕКТУРА:
+------------
+• process() вызывает _readCommandQueue() и _readIncomingQueue()
+• Команды из _cmdQueue → onCommand(Command)
+• Сообщения из _inQueue → onMessage(const char*)
+• Ответы отправляются через _sendToBluetooth()
+
+================================================================================
+*/
+
 #ifndef PROTOCOL_MANAGER_H
 #define PROTOCOL_MANAGER_H
 
-#include "types.h"      // ПЕРВЫМ!
+#include "types.h"
 #include "BaseObject.h"
 #include <ArduinoJson.h>
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "debug.h"
 
-#define PROTOCOL_QUEUE_DEPTH   1
-#define PROTOCOL_TASK_STACK    4096
-#define PROTOCOL_TASK_PRIORITY 5
+// ----------------------------------------------------------------------------
+// КОНФИГУРАЦИЯ
+// ----------------------------------------------------------------------------
+#define PROTOCOL_QUEUE_DEPTH   1       // Глубина очереди входящих сообщений
+#define PROTOCOL_TASK_STACK    4096    // Размер стека задачи
+#define PROTOCOL_TASK_PRIORITY 2       // Приоритет задачи
 
+// ----------------------------------------------------------------------------
+// ТИПЫ (временный callback, будет удалён)
+// ----------------------------------------------------------------------------
 typedef void (*ProtocolCommandCallback)(Command cmd, const char* payload);
 
 class ProtocolManager : public BaseObject {
 public:
-    ProtocolManager();
+    // ========================================================================
+    // КОНСТРУКТОР / ДЕСТРУКТОР
+    // ========================================================================
+    
+    ProtocolManager(const char* name = "Protocol", 
+                    UBaseType_t priority = PROTOCOL_TASK_PRIORITY, 
+                    uint32_t stackSize = PROTOCOL_TASK_STACK, 
+                    BaseType_t core = 1);
     ~ProtocolManager();
 
-    bool start() override;   // Совпадает с BaseObject::start()
+    // ========================================================================
+    // УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ
+    // ========================================================================
+    
+    bool start() override;
     void stop() override;
 
+    // ========================================================================
+    // ДОСТУП К ОЧЕРЕДЯМ (для BluetoothManager)
+    // ========================================================================
+    
     QueueHandle_t getInQueue() const { return _inQueue; }
-    void setTxTarget(QueueHandle_t queue) { _btOutQueue = queue; }
-
-    void setCommandCallback(ProtocolCommandCallback callback);
-    bool sendResponse(Command cmd, ResponseStatus status, const char* data = nullptr);
+    
+    // ========================================================================
+    // ОТПРАВКА ОТВЕТОВ
+    // ========================================================================
+    
+    void sendResponse(Command cmd, ResponseStatus status, const char* data = nullptr);
+    
+    // ========================================================================
+    // ВРЕМЕННЫЙ CALLBACK (будет удалён)
+    // ========================================================================
+    void setCommandCallback(ProtocolCommandCallback callback) { _cmdCallback = callback; }
 
 protected:
-    void process() override;
-    void onCommand(Command cmd) override;
+    // ========================================================================
+    // ХУКИ БАЗОВОГО КЛАССА
+    // ========================================================================
+    
+    void process() override;                    // Главный цикл задачи
+    void onCommand(Command cmd) override;       // Обработчик команд из _cmdQueue
+    
+    // ========================================================================
+    // ОБРАБОТЧИК СООБЩЕНИЙ (симметрично onCommand)
+    // ========================================================================
+    
+    virtual void onMessage(const char* json);   // Обработчик входящих JSON-сообщений
 
 private:
-    QueueHandle_t _inQueue;      // ВЛАДЕЕМ
-    QueueHandle_t _btOutQueue;   // ССЫЛКА (только запись)
-    SemaphoreHandle_t _jsonMutex;
-    ProtocolCommandCallback _cmdCallback;
-    uint32_t _processedCount;
-    uint32_t _errorCount;
-
-    void _processIncoming();
-    void _pushToPeer(const char* jsonStr);
+    // ========================================================================
+    // ОЧЕРЕДИ И СИНХРОНИЗАЦИЯ
+    // ========================================================================
+    
+    QueueHandle_t       _inQueue;       // Очередь входящих сообщений от Bluetooth
+    SemaphoreHandle_t   _jsonMutex;     // Мьютекс для защиты при копировании
+    
+    // ========================================================================
+    // ВРЕМЕННЫЙ CALLBACK
+    // ========================================================================
+    
+    ProtocolCommandCallback _cmdCallback;   // TODO: удалить после реализации onMessage
+    
+    // ========================================================================
+    // СТАТИСТИКА
+    // ========================================================================
+    
+    uint32_t _processedCount;   // Количество обработанных сообщений
+    uint32_t _errorCount;       // Количество ошибок
+    
+    // ========================================================================
+    // ВНУТРЕННИЕ МЕТОДЫ
+    // ========================================================================
+    
+    void _readIncomingQueue();              // Чтение _inQueue → onMessage()
+    void _sendToBluetooth(const char* json); // Отправка ответа в BluetoothManager
+    Command _stringToCommand(const char* str); // Преобразование строки в Command
 };
 
 #endif // PROTOCOL_MANAGER_H

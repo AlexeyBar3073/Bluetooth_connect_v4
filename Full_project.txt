@@ -1,0 +1,1418 @@
+// ======================================================================
+// Собранный проект: Bluetooth_connect_v2
+// Дата сборки: D:\VS_Code_project\Bluetooth_connect_v4
+// ======================================================================
+
+// START platformio.ini
+// ======================================================================
+; PlatformIO Project Configuration File
+;
+;   Build options: build flags, source filter
+;   Upload options: custom upload port, speed and extra flags
+;   Library options: dependencies, extra library storages
+;   Advanced options: extra scripting
+;
+; Please visit documentation for the other options and examples
+; https://docs.platformio.org/page/projectconf.html
+
+[common]
+platform = espressif32
+board = wemos_d1_mini32
+framework = arduino
+upload_speed = 921600
+monitor_speed = 115200
+board_build.partitions = partitions_4mb.csv
+lib_deps_base = 
+	bblanchon/ArduinoJson
+build_flags_common = 
+	-DCONFIG_ARDUHAL_LOG_COLORS=1
+	-DCONFIG_FREERTOS_UNICORE=0
+	-I src/common
+	-I include
+	-D REAL_ENGINE_ENABLED=0
+
+[env:wemos_d1_mini32]
+platform = ${common.platform}
+board = ${common.board}
+framework = ${common.framework}
+upload_speed = ${common.upload_speed}
+monitor_speed = ${common.monitor_speed}
+lib_deps = 
+	${common.lib_deps_base}
+build_flags = 
+	${common.build_flags_common}
+	-D DEBUG_LOG=1
+	-D OLED_ENABLED=0
+	-D configMAX_QUEUES=40
+extra_scripts = post:extra_script.py
+
+[env:wemos_d1_mini32_release]
+platform = ${common.platform}
+board = ${common.board}
+framework = ${common.framework}
+upload_speed = ${common.upload_speed}
+monitor_speed = ${common.monitor_speed}
+lib_deps = 
+	${common.lib_deps_base}
+build_flags = 
+	${common.build_flags_common}
+	-D DEBUG_LOG=0
+	-D OLED_ENABLED=0
+	-D configMAX_QUEUES=40
+extra_scripts = post:extra_script.py
+// END platformio.ini
+
+
+// START src/BaseObject.cpp
+// ======================================================================
+/*
+================================================================================
+BASEOBJECT.CPP — РЕАЛИЗАЦИЯ БАЗОВОГО КЛАССА
+================================================================================
+*/
+
+#include "BaseObject.h"
+#include "debug.h"
+
+// ============================================================================
+// КОНСТРУКТОР / ДЕСТРУКТОР
+// ============================================================================
+
+BaseObject::BaseObject(const char* name, UBaseType_t priority, uint32_t stackSize, BaseType_t core)
+    : _taskHandle(nullptr)
+    , _name(name)
+    , _state(ObjectState::STATE_STOPPED)
+    , _priority(priority)
+    , _stackSize(stackSize)
+    , _core(core)
+    , _cmdQueue(nullptr)
+{
+    _cmdQueue = xQueueCreate(BASE_CMD_QUEUE_DEPTH, sizeof(BASE_CMD_TYPE));
+    if (!_cmdQueue) {
+        DBG_PRINTF("[%s] ERROR: Failed to create command queue", _name);
+        _state = ObjectState::STATE_ERROR;
+    } else {
+        DBG_PRINTF("[%s] Created (queue depth=%d)", _name, BASE_CMD_QUEUE_DEPTH);
+    }
+}
+
+BaseObject::~BaseObject() {
+    if (_state == ObjectState::STATE_RUNNING) {
+        stop();
+    }
+    if (_cmdQueue) {
+        vQueueDelete(_cmdQueue);
+        _cmdQueue = nullptr;
+    }
+}
+
+// ============================================================================
+// УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ
+// ============================================================================
+
+bool BaseObject::start() {
+    if (_state == ObjectState::STATE_RUNNING) return true;
+
+    // Сначала ставим флаг, что мы должны бежать
+    _state = ObjectState::STATE_RUNNING; 
+
+    BaseType_t res = xTaskCreatePinnedToCore(
+        taskWrapper,
+        _name,
+        _stackSize,
+        this,
+        _priority,
+        &_taskHandle,
+        _core
+    );
+
+    if (res != pdPASS) {
+        _state = ObjectState::STATE_ERROR; // Если не взлетело — сбрасываем в ошибку
+        DBG_PRINTF("[%s] ERROR: Task creation failed", _name);
+        return false;
+    }
+    
+    DBG_PRINTF("[%s] Started (Core %d)", _name, _core);
+    return true;
+}
+
+void BaseObject::stop() {
+    if (_state == ObjectState::STATE_RUNNING && _taskHandle) {
+        DBG_PRINTF("[%s] Stopping...", _name);
+        vTaskDelete(_taskHandle);
+        _taskHandle = nullptr;
+        _state = ObjectState::STATE_STOPPED;
+        DBG_PRINTF("[%s] Stopped", _name);
+    }
+}
+
+// ============================================================================
+// ИНФОРМАЦИЯ О СОСТОЯНИИ
+// ============================================================================
+
+bool BaseObject::isRunning() const { 
+    return _state == ObjectState::STATE_RUNNING; 
+}
+
+ObjectState BaseObject::getState() const { 
+    return _state; 
+}
+
+const char* BaseObject::getName() const { 
+    return _name; 
+}
+
+// ============================================================================
+// ОЧЕРЕДЬ КОМАНД
+// ============================================================================
+
+bool BaseObject::sendCommand(Command cmd) {
+    if (!_cmdQueue) return false;
+    BASE_CMD_TYPE val = static_cast<BASE_CMD_TYPE>(cmd);
+    return xQueueSend(_cmdQueue, &val, 0) == pdTRUE;
+}
+
+// ============================================================================
+// ЦИКЛ ЗАДАЧИ
+// ============================================================================
+
+void BaseObject::taskLoop() {
+    while (_state == ObjectState::STATE_RUNNING) {
+        // 1. Проверка очереди команд
+        BASE_CMD_TYPE cmdVal;
+        if (xQueueReceive(_cmdQueue, &cmdVal, 0) == pdTRUE) {
+            onCommand(static_cast<Command>(cmdVal));
+        }
+        
+        // 2. Бизнес-логика наследника
+        process();
+        
+        // 3. Передача управления планировщику
+        vTaskDelay(1);
+    }
+}
+
+// ============================================================================
+// ХУКИ ДЛЯ ПЕРЕОПРЕДЕЛЕНИЯ (реализация по умолчанию)
+// ============================================================================
+
+void BaseObject::onCommand(Command cmd) {
+    // По умолчанию — игнорируем команду
+    (void)cmd;
+}
+
+// ============================================================================
+// СТАТИЧЕСКАЯ ОБЁРТКА ДЛЯ ЗАДАЧИ FREERTOS
+// ============================================================================
+
+void BaseObject::taskWrapper(void* pvParameters) {
+    BaseObject* obj = static_cast<BaseObject*>(pvParameters);
+    if (obj) {
+        obj->taskLoop();
+    }
+    vTaskDelete(nullptr);
+}
+// END src/BaseObject.cpp
+
+
+// START src/BluetoothManager.cpp
+// ======================================================================
+/*
+================================================================================
+BLUETOOTHMANAGER.CPP — РЕАЛИЗАЦИЯ МЕНЕДЖЕРА BLUETOOTH
+================================================================================
+*/
+
+#include "BluetoothManager.h"
+#include "ProtocolManager.h"   // <-- ДОБАВИТЬ ПОЛНЫЙ ЗАГОЛОВОК!
+
+// Внешняя ссылка на ProtocolManager (определён в main.cpp)
+extern ProtocolManager protocol;
+
+// ============================================================================
+// КОНСТРУКТОР / ДЕСТРУКТОР
+// ============================================================================
+
+BluetoothManager::BluetoothManager(const char* name, UBaseType_t priority, 
+                                   uint32_t stackSize, BaseType_t core)
+    : BaseObject(name, priority, stackSize, core)
+    , _outQueue(nullptr)
+    , _isConnected(false)
+    , _lastBlinkTime(0)
+    , _blinkCount(0)
+    , _ledState(false)
+    , _blinkSequenceActive(false)
+{
+    pinMode(BT_LED_PIN, OUTPUT);
+    _setLed(false);
+}
+
+BluetoothManager::~BluetoothManager() {
+    if (_outQueue) {
+        vQueueDelete(_outQueue);
+        _outQueue = nullptr;
+    }
+    _setLed(false);
+}
+
+// ============================================================================
+// ИНИЦИАЛИЗАЦИЯ И УПРАВЛЕНИЕ
+// ============================================================================
+
+bool BluetoothManager::init(const char* deviceName) {
+    DBG_PRINTF("[BT] Initializing '%s'...", deviceName);
+    
+    if (!_bt.begin(deviceName)) {
+        DBG_PRINTLN("[BT] ERROR: Hardware init failed");
+        _state = ObjectState::STATE_ERROR;
+        return false;
+    }
+    DBG_PRINTF("[BT] Hardware OK: '%s'", deviceName);
+    
+    _outQueue = xQueueCreate(BT_OUT_QUEUE_DEPTH, sizeof(BtOutMessage));
+    if (!_outQueue) {
+        DBG_PRINTLN("[BT] ERROR: Output queue creation failed");
+        _state = ObjectState::STATE_ERROR;
+        return false;
+    }
+    DBG_PRINTF("[BT] Output queue created (depth=%d, msg_size=%u)", 
+               BT_OUT_QUEUE_DEPTH, (unsigned)sizeof(BtOutMessage));
+    
+    pinMode(BT_LED_PIN, OUTPUT);
+    _setLed(false);
+    
+    return BaseObject::start();
+}
+
+void BluetoothManager::stop() {
+    DBG_PRINTLN("[BT] Stopping...");
+    BaseObject::stop();
+    if (_outQueue) {
+        vQueueDelete(_outQueue);
+        _outQueue = nullptr;
+    }
+    _setLed(false);
+}
+
+// ============================================================================
+// ОТПРАВКА ДАННЫХ В PROTOCOL
+// ============================================================================
+
+void BluetoothManager::sendToProtocol(const char* json) {
+    // В будущем: DataRouter::publish(TOPIC_MSG_INCOMING, json)
+    // Пока — прямой вызов ProtocolManager
+    QueueHandle_t targetQueue = protocol.getInQueue();
+    if (!targetQueue) return;
+    
+    ProtocolInMessage msg;
+    uint16_t len = strlen(json);
+    if (len >= sizeof(msg.payload)) {
+        len = sizeof(msg.payload) - 1;
+    }
+    msg.len = len;
+    memcpy(msg.payload, json, len);
+    msg.payload[len] = '\0';
+    
+    xQueueOverwrite(targetQueue, &msg);
+}
+
+// ============================================================================
+// ХУКИ БАЗОВОГО КЛАССА
+// ============================================================================
+
+void BluetoothManager::process() {
+    bool current = _bt.hasClient();
+    if (current != _isConnected) {
+        _handleConnectionChange(current);
+    }
+    
+    _updateLed();
+    _processTx();
+    _processRx();
+}
+
+void BluetoothManager::onCommand(Command cmd) {
+    if (cmd == Command::CMD_OTA_START) {
+        DBG_PRINTLN("[BT] OTA requested");
+    } else {
+        BaseObject::onCommand(cmd);
+    }
+}
+
+// ============================================================================
+// ОБРАБОТКА ДАННЫХ
+// ============================================================================
+
+void BluetoothManager::_processTx() {
+    BtOutMessage msg;
+    if (xQueueReceive(_outQueue, &msg, 0) == pdTRUE) {
+        _bt.write((uint8_t*)msg.data, msg.len);
+    }
+}
+
+void BluetoothManager::_processRx() {
+    static char buf[256];
+    static uint16_t pos = 0;
+    
+    while (_bt.available()) {
+        char c = _bt.read();
+        if (c == '\r') continue;
+        
+        if (c == '\n') {
+            if (pos > 0) {
+                buf[pos] = '\0';
+                sendToProtocol(buf);
+                pos = 0;
+            }
+        } else {
+            if (pos < sizeof(buf) - 1) {
+                buf[pos++] = c;
+            } else {
+                DBG_PRINTLN("[BT] RX buffer overflow");
+                pos = 0;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// УПРАВЛЕНИЕ ПОДКЛЮЧЕНИЕМ
+// ============================================================================
+
+void BluetoothManager::_handleConnectionChange(bool currentState) {
+    _isConnected = currentState;
+    
+    if (_isConnected) {
+        DBG_PRINTLN("[BT] Connected");
+        _blinkSequenceActive = false;
+        _blinkCount = 0;
+        _setLed(true);
+    } else {
+        DBG_PRINTLN("[BT] Disconnected");
+        _blinkSequenceActive = true;
+        _blinkCount = 0;
+        _lastBlinkTime = millis();
+        _setLed(false);
+    }
+}
+
+// ============================================================================
+// УПРАВЛЕНИЕ LED
+// ============================================================================
+
+void BluetoothManager::_updateLed() {
+    if (_isConnected) {
+        return;  // При подключении LED горит постоянно
+    }
+    
+    if (!_blinkSequenceActive) {
+        _setLed(false);
+        return;
+    }
+    
+    uint32_t now = millis();
+    if (now - _lastBlinkTime >= BT_LED_BLINK_INTERVAL) {
+        _lastBlinkTime = now;
+        
+        if (_blinkCount < BT_LED_BLINK_COUNT) {
+            _ledState = !_ledState;
+            _setLed(_ledState);
+            if (_ledState) {
+                _blinkCount++;
+            }
+        } else {
+            _blinkSequenceActive = false;
+            _setLed(false);
+        }
+    }
+}
+
+void BluetoothManager::_setLed(bool state) {
+    _ledState = state;
+    digitalWrite(BT_LED_PIN, state ? HIGH : LOW);
+}
+// END src/BluetoothManager.cpp
+
+
+// START src/main.cpp
+// ======================================================================
+/*
+================================================================================
+MAIN.CPP — ТОЧКА ВХОДА
+================================================================================
+
+НАЗНАЧЕНИЕ:
+-----------
+Создаёт глобальные объекты, запускает их, связывает через прямые вызовы.
+Вся бизнес-логика вынесена в модули.
+
+================================================================================
+*/
+
+#include <Arduino.h>
+#include "types.h"
+#include "debug.h"
+#include "BluetoothManager.h"
+#include "ProtocolManager.h"
+
+// ============================================================================
+// ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
+// ============================================================================
+
+BluetoothManager bt;
+ProtocolManager protocol;
+
+// ============================================================================
+// ОБРАБОТЧИК КОМАНД
+// ============================================================================
+
+void onCommandReceived(Command cmd, const char* payload) {
+    DBG_PRINTF("[APP] Cmd: 0x%02X", static_cast<uint8_t>(cmd));
+    
+    switch (cmd) {
+        case Command::CMD_NONE:
+            protocol.sendResponse(cmd, ResponseStatus::STATUS_ERROR, "invalid");
+            break;
+            
+        case Command::CMD_GET_CFG:
+            DBG_PRINTLN("[APP] Config requested");
+            protocol.sendResponse(cmd, ResponseStatus::STATUS_OK, "{\"tank\":50}");
+            break;
+            
+        default:
+            protocol.sendResponse(cmd, ResponseStatus::STATUS_OK, "ok");
+            break;
+    }
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    
+    DBG_NEWLINE();
+    DBG_PRINTLN("=== Car Monitor V3 Starting ===");
+    DBG_PRINTF("Free Heap: %u bytes", ESP.getFreeHeap());
+    DBG_NEWLINE();
+
+    // Инициализация Bluetooth
+    if (!bt.init("Car Monitor V3")) {
+        DBG_PRINTLN("[MAIN] CRITICAL: BT init failed");
+        while (true) { delay(1000); }
+    }
+    
+    // Запуск Protocol
+    if (!protocol.start()) {
+        DBG_PRINTLN("[MAIN] CRITICAL: Protocol start failed");
+        while (true) { delay(1000); }
+    }
+
+    // Установка callback для обработки команд
+    protocol.setCommandCallback(onCommandReceived);
+    
+    DBG_NEWLINE();
+    DBG_PRINTLN("=== System READY ===");
+    DBG_PRINTF("Free Heap: %u bytes", ESP.getFreeHeap());
+    DBG_NEWLINE();
+}
+
+// ============================================================================
+// LOOP
+// ============================================================================
+
+void loop() {
+#if DEBUG_LOG
+    static uint32_t lastMemLog = 0;
+    if (millis() - lastMemLog > 10000) {
+        lastMemLog = millis();
+        DBG_PRINTF("[MEM] Free: %u", ESP.getFreeHeap());
+    }
+#endif
+    delay(100);
+}
+// END src/main.cpp
+
+
+// START src/ProtocolManager.cpp
+// ======================================================================
+/*
+================================================================================
+PROTOCOLMANAGER.CPP — РЕАЛИЗАЦИЯ МЕНЕДЖЕРА ПРОТОКОЛА
+================================================================================
+*/
+
+#include "ProtocolManager.h"
+#include "BluetoothManager.h"
+
+// Внешняя ссылка на BluetoothManager (определён в main.cpp)
+extern BluetoothManager bt;
+
+// ============================================================================
+// КОНСТРУКТОР / ДЕСТРУКТОР
+// ============================================================================
+
+ProtocolManager::ProtocolManager(const char* name, UBaseType_t priority, 
+                                 uint32_t stackSize, BaseType_t core)
+    : BaseObject(name, priority, stackSize, core)
+    , _inQueue(nullptr)
+    , _jsonMutex(nullptr)
+    , _cmdCallback(nullptr)
+    , _processedCount(0)
+    , _errorCount(0)
+{}
+
+ProtocolManager::~ProtocolManager() {
+    if (_inQueue) {
+        vQueueDelete(_inQueue);
+        _inQueue = nullptr;
+    }
+    if (_jsonMutex) {
+        vSemaphoreDelete(_jsonMutex);
+        _jsonMutex = nullptr;
+    }
+}
+
+// ============================================================================
+// УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ
+// ============================================================================
+
+bool ProtocolManager::start() {
+    DBG_PRINTLN("[PROTOCOL] Starting...");
+    
+    _inQueue = xQueueCreate(PROTOCOL_QUEUE_DEPTH, sizeof(ProtocolInMessage));
+    if (!_inQueue) {
+        DBG_PRINTLN("[PROTOCOL] ERROR: Input queue creation failed");
+        _state = ObjectState::STATE_ERROR;
+        return false;
+    }
+    DBG_PRINTF("[PROTOCOL] Input queue created (depth=%d, msg_size=%u)", 
+               PROTOCOL_QUEUE_DEPTH, (unsigned)sizeof(ProtocolInMessage));
+    
+    _jsonMutex = xSemaphoreCreateMutex();
+    if (!_jsonMutex) {
+        DBG_PRINTLN("[PROTOCOL] ERROR: Mutex creation failed");
+        vQueueDelete(_inQueue);
+        _inQueue = nullptr;
+        _state = ObjectState::STATE_ERROR;
+        return false;
+    }
+    DBG_PRINTLN("[PROTOCOL] JSON mutex created");
+    
+    return BaseObject::start();
+}
+
+void ProtocolManager::stop() {
+    DBG_PRINTLN("[PROTOCOL] Stopping...");
+    BaseObject::stop();
+    if (_inQueue) {
+        vQueueDelete(_inQueue);
+        _inQueue = nullptr;
+    }
+    if (_jsonMutex) {
+        vSemaphoreDelete(_jsonMutex);
+        _jsonMutex = nullptr;
+    }
+}
+
+// ============================================================================
+// ОТПРАВКА ОТВЕТОВ
+// ============================================================================
+
+void ProtocolManager::sendResponse(Command cmd, ResponseStatus status, const char* data) {
+    JsonDocument doc;
+    doc["cmd"] = static_cast<uint8_t>(cmd);
+    doc["status"] = static_cast<uint8_t>(status);
+    if (data) {
+        doc["data"] = data;
+    }
+    
+    char buf[512];
+    size_t len = serializeJson(doc, buf, sizeof(buf));
+    if (len > 0 && len < sizeof(buf)) {
+        buf[len] = '\0';
+        _sendToBluetooth(buf);
+    } else {
+        _errorCount++;
+        DBG_PRINTLN("[PROTOCOL] ERROR: Response too large");
+    }
+}
+
+// ============================================================================
+// ХУКИ БАЗОВОГО КЛАССА
+// ============================================================================
+
+void ProtocolManager::process() {
+    _readIncomingQueue();   // Сообщения от Bluetooth
+}
+
+void ProtocolManager::onCommand(Command cmd) {
+    DBG_PRINTF("[PROTOCOL] Command: 0x%02X", static_cast<uint8_t>(cmd));
+    
+    // В будущем — полноценная обработка команд
+    // Пока пробрасываем в старый callback для совместимости
+    if (_cmdCallback) {
+        _cmdCallback(cmd, nullptr);
+    }
+}
+
+// ============================================================================
+// ОБРАБОТЧИК СООБЩЕНИЙ
+// ============================================================================
+
+void ProtocolManager::onMessage(const char *msg)
+{
+    //--- Идентификатор входящего сообщения
+    static int msgId = 0;
+
+    //--- Идентификатор команды
+    Command cmd = Command::CMD_NONE;
+
+    //--- Десериализуем входящее сообщение
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, msg);
+    if (error) {
+        DBG_PRINTF("[PROTOCOL] ERROR: Failed to parse JSON: %s", error.c_str());
+        return;
+    }
+
+    //--- Получаем идентификатор входящего сообщения
+    msgId = (int)doc["msg_id"];
+
+    //--- Готовоим объект для ответа
+    JsonDocument resp;
+    //--- Если идентификатор входящей команды не равен 0, тогда отвечаем
+    if (msgId != 0)
+    {
+        resp["ack_id"] = msgId;
+        msgId = 0;
+    }
+
+    //--- Получаем идентификатор команды
+    const char *cmdStr = doc["command"];
+    cmd = (Command)_stringToCommand(cmdStr);
+    if (cmd != Command::CMD_NONE)
+    {
+        onCommand(cmd); // Вызываем обработчик
+    }
+}
+
+// ============================================================================
+// ВНУТРЕННИЕ МЕТОДЫ
+// ============================================================================
+
+void ProtocolManager::_readIncomingQueue() {
+    ProtocolInMessage msg;
+    
+    // Неблокирующее чтение
+    if (xQueueReceive(_inQueue, &msg, 0) != pdTRUE) {
+        return;
+    }
+    
+    // Захватываем мьютекс только на время копирования
+    if (xSemaphoreTake(_jsonMutex, 10 / portTICK_PERIOD_MS) != pdTRUE) {
+        return;
+    }
+    
+    char localBuffer[sizeof(msg.payload)];
+    strncpy(localBuffer, msg.payload, sizeof(localBuffer) - 1);
+    localBuffer[sizeof(localBuffer) - 1] = '\0';
+    
+    // Освобождаем мьютекс — очередь свободна
+    xSemaphoreGive(_jsonMutex);
+    
+    // Вызываем обработчик
+    onMessage(localBuffer);
+}
+
+void ProtocolManager::_sendToBluetooth(const char* json) {
+    QueueHandle_t targetQueue = bt.getOutQueue();
+    if (!targetQueue) return;
+    
+    BtOutMessage msg;
+    uint16_t len = strlen(json);
+    if (len >= sizeof(msg.data)) {
+        len = sizeof(msg.data) - 1;
+        DBG_PRINTLN("[PROTOCOL] WARNING: Response truncated");
+    }
+    msg.len = len;
+    memcpy(msg.data, json, len);
+    msg.data[len] = '\0';
+    
+    xQueueOverwrite(targetQueue, &msg);
+}
+
+Command ProtocolManager::_stringToCommand(const char* str) {
+    if (!str) return Command::CMD_NONE;
+    
+    for (const auto& item : COMMAND_TABLE) {
+        if (strcmp(str, item.str) == 0) {
+            return item.cmd;
+        }
+    }
+    return Command::CMD_NONE;
+}
+// END src/ProtocolManager.cpp
+
+
+// START include/BaseObject.h
+// ======================================================================
+/*
+================================================================================
+BASEOBJECT.H — БАЗОВЫЙ КЛАСС ДЛЯ АВТОНОМНЫХ ЗАДАЧ
+================================================================================
+
+НАЗНАЧЕНИЕ:
+-----------
+Абстрактный базовый класс для всех модулей системы, работающих в отдельных
+задачах FreeRTOS. Предоставляет единый шаблон жизненного цикла и межзадачного
+взаимодействия.
+
+ВОЗМОЖНОСТИ:
+------------
+• Автоматическое создание задачи FreeRTOS при вызове start()
+• Встроенная очередь команд для управления модулем
+• Единый цикл задачи с хуками process() и onCommand()
+• Управление состоянием (STOPPED / RUNNING / ERROR)
+• Корректное завершение задачи при вызове stop()
+
+КАК ИСПОЛЬЗОВАТЬ:
+-----------------
+1. Создать класс-наследник
+2. Переопределить process() — бизнес-логика
+3. Переопределить onCommand() — обработка команд (опционально)
+4. Вызвать start() для запуска задачи
+
+ПРИМЕР:
+-------
+class MyModule : public BaseObject {
+public:
+    MyModule() : BaseObject("MyModule") {}
+protected:
+    void process() override {
+        // Выполняется в цикле задачи
+    }
+    void onCommand(Command cmd) override {
+        if (cmd == Command::CMD_OTA_START) {
+            // Реакция на команду
+        }
+    }
+};
+
+ВАЖНО:
+------
+• types.h должен быть подключён ПЕРЕД этим файлом!
+• Не блокировать process() надолго — задачи должны отдавать управление
+• Для ожидания использовать очереди/семафоры, а не циклы с delay()
+
+================================================================================
+*/
+
+#ifndef BASE_OBJECT_H
+#define BASE_OBJECT_H
+
+#include "types.h"
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+class BaseObject {
+public:
+    // ========================================================================
+    // КОНСТРУКТОР / ДЕСТРУКТОР
+    // ========================================================================
+    
+    /**
+     * Создаёт объект и внутреннюю очередь команд.
+     * Задача FreeRTOS НЕ запускается автоматически — нужен вызов start().
+     */
+    BaseObject(const char* name, 
+               UBaseType_t priority = 5, 
+               uint32_t stackSize = 4096, 
+               BaseType_t core = 1);
+    
+    /// Виртуальный деструктор. Останавливает задачу и удаляет очередь команд.
+    virtual ~BaseObject();
+
+    // ========================================================================
+    // УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ
+    // ========================================================================
+    
+    /**
+     * Запускает задачу FreeRTOS.
+     * Возвращает true если задача успешно создана, false при ошибке.
+     */
+    virtual bool start();
+    
+    /**
+     * Останавливает и удаляет задачу FreeRTOS.
+     * Очередь команд сохраняется, объект можно перезапустить.
+     */
+    virtual void stop();
+
+    // ========================================================================
+    // ИНФОРМАЦИЯ О СОСТОЯНИИ
+    // ========================================================================
+    
+    bool isRunning() const;                     ///< true если задача активна
+    ObjectState getState() const;               ///< Текущее состояние
+    const char* getName() const;                ///< Имя задачи
+
+    // ========================================================================
+    // ОЧЕРЕДЬ КОМАНД
+    // ========================================================================
+    
+    /// Возвращает хендл очереди команд (для внешнего использования).
+    QueueHandle_t getCommandQueue() const { return _cmdQueue; }
+    
+    /// Отправляет команду во внутреннюю очередь (неблокирующая).
+    bool sendCommand(Command cmd);
+
+protected:
+    // ========================================================================
+    // ХУКИ ДЛЯ ПЕРЕОПРЕДЕЛЕНИЯ
+    // ========================================================================
+    
+    /**
+     * Основная бизнес-логика модуля.
+     * Вызывается в бесконечном цикле задачи. ОБЯЗАТЕЛЬНА к переопределению.
+     */
+    virtual void process() = 0;
+    
+    /**
+     * Обработчик команд из очереди.
+     * Вызывается при получении команды. Переопределять не обязательно.
+     */
+    virtual void onCommand(Command cmd);
+
+    // ========================================================================
+    // ВНУТРЕННИЙ ЦИКЛ ЗАДАЧИ (НЕ ПЕРЕОПРЕДЕЛЯТЬ!)
+    // ========================================================================
+    
+    void taskLoop();
+
+    // ========================================================================
+    // ЗАЩИЩЁННЫЕ ПОЛЯ
+    // ========================================================================
+    
+    TaskHandle_t    _taskHandle;    ///< Хендл задачи FreeRTOS
+    const char*     _name;          ///< Имя задачи (для логов)
+    ObjectState     _state;         ///< Текущее состояние
+    UBaseType_t     _priority;      ///< Приоритет задачи
+    uint32_t        _stackSize;     ///< Размер стека в байтах
+    BaseType_t      _core;          ///< Ядро (0 или 1)
+    QueueHandle_t   _cmdQueue;      ///< Очередь команд (владеем)
+
+private:
+    // ========================================================================
+    // СТАТИЧЕСКАЯ ОБЁРТКА ДЛЯ ЗАДАЧИ FREERTOS
+    // ========================================================================
+    static void taskWrapper(void* pvParameters);
+};
+
+#endif // BASE_OBJECT_H
+// END include/BaseObject.h
+
+
+// START include/BluetoothManager.h
+// ======================================================================
+/*
+================================================================================
+BLUETOOTHMANAGER.H — МЕНЕДЖЕР BLUETOOTH SPP
+================================================================================
+
+НАЗНАЧЕНИЕ:
+-----------
+Управляет Bluetooth-соединением. Принимает входящие JSON-строки и отправляет
+исходящие. Работает в отдельной задаче FreeRTOS.
+
+ОСОБЕННОСТИ:
+------------
+• Принимает данные по SPP, разделённые символом '\n'
+• Передаёт полученные строки в ProtocolManager через прямой вызов sendToProtocol()
+• Отправляет исходящие данные из очереди _outQueue
+• Управляет LED для индикации состояния подключения
+
+В будущем sendToProtocol() будет отправлять данные через DataRouter.
+
+================================================================================
+*/
+
+#ifndef BLUETOOTH_MANAGER_H
+#define BLUETOOTH_MANAGER_H
+
+#include "types.h"
+#include "BaseObject.h"
+#include <BluetoothSerial.h>
+#include "debug.h"
+
+// ----------------------------------------------------------------------------
+// КОНФИГУРАЦИЯ
+// ----------------------------------------------------------------------------
+#define BT_LED_PIN             2       // Пин для индикации
+#define BT_DEFAULT_DEVICE_NAME "Car Monitor V3"
+#define BT_LED_BLINK_INTERVAL  300     // Интервал мигания LED (мс)
+#define BT_LED_BLINK_COUNT     5       // Количество миганий при отключении
+#define BT_OUT_QUEUE_DEPTH     1       // Глубина очереди исходящих сообщений
+
+class BluetoothManager : public BaseObject {
+public:
+    // ========================================================================
+    // КОНСТРУКТОР / ДЕСТРУКТОР
+    // ========================================================================
+    
+    BluetoothManager(const char* name = "BT_Manager", 
+                     UBaseType_t priority = 2, 
+                     uint32_t stackSize = 4096, 
+                     BaseType_t core = 0);
+    ~BluetoothManager();
+
+    // ========================================================================
+    // ИНИЦИАЛИЗАЦИЯ И УПРАВЛЕНИЕ
+    // ========================================================================
+    
+    /// Инициализирует Bluetooth и запускает задачу.
+    bool init(const char* deviceName = BT_DEFAULT_DEVICE_NAME);
+    
+    /// Останавливает задачу и освобождает ресурсы.
+    void stop() override;
+
+    // ========================================================================
+    // ДОСТУП К ОЧЕРЕДЯМ (для прямых связей)
+    // ========================================================================
+    
+    /// Возвращает очередь для отправки данных в Bluetooth.
+    QueueHandle_t getOutQueue() const { return _outQueue; }
+    
+    // ========================================================================
+    // ОТПРАВКА ДАННЫХ
+    // ========================================================================
+    
+    /// Отправляет JSON-строку в ProtocolManager (прямой вызов).
+    /// В будущем будет использовать DataRouter.
+    void sendToProtocol(const char* json);
+    
+    // ========================================================================
+    // СОСТОЯНИЕ
+    // ========================================================================
+    
+    bool isConnected() const { return _isConnected; }
+
+protected:
+    // ========================================================================
+    // ХУКИ БАЗОВОГО КЛАССА
+    // ========================================================================
+    
+    void process() override;
+    void onCommand(Command cmd) override;
+
+private:
+    // ========================================================================
+    // АППАРАТНЫЕ РЕСУРСЫ
+    // ========================================================================
+    
+    BluetoothSerial _bt;                // Объект Bluetooth SPP
+    
+    // ========================================================================
+    // ОЧЕРЕДИ
+    // ========================================================================
+    
+    QueueHandle_t _outQueue;            // Очередь исходящих сообщений (владеем)
+    
+    // ========================================================================
+    // СОСТОЯНИЕ ПОДКЛЮЧЕНИЯ
+    // ========================================================================
+    
+    bool _isConnected;                  // true = клиент подключен
+    
+    // ========================================================================
+    // УПРАВЛЕНИЕ LED
+    // ========================================================================
+    
+    uint32_t _lastBlinkTime;            // Время последнего переключения LED
+    uint8_t  _blinkCount;               // Счётчик миганий
+    bool     _ledState;                 // Текущее состояние LED
+    bool     _blinkSequenceActive;      // Активна ли серия миганий
+    
+    void _updateLed();                  // Обновляет состояние LED
+    void _handleConnectionChange(bool currentState);  // Обработка подключения/отключения
+    void _setLed(bool state);           // Устанавливает LED в заданное состояние
+    
+    // ========================================================================
+    // ОБРАБОТКА ДАННЫХ
+    // ========================================================================
+    
+    void _processTx();                  // Отправка данных из очереди в Bluetooth
+    void _processRx();                  // Чтение данных из Bluetooth и передача в Protocol
+};
+
+#endif // BLUETOOTH_MANAGER_H
+// END include/BluetoothManager.h
+
+
+// START include/debug.h
+// ======================================================================
+/*
+================================================================================
+DEBUG MACROS — ЦЕНТРАЛИЗОВАННОЕ УПРАВЛЕНИЕ ОТЛАДКОЙ
+================================================================================
+Файл: debug.h
+Назначение:
+-----------
+Единая точка управления отладочным выводом для всего проекта.
+Позволяет полностью исключить код логирования из релизной сборки,
+экономя Flash-память и избегая накладных расходов.
+
+Принципы работы:
+----------------
+• В режиме DEBUG (DEBUG_LOG=1):
+  - Логи выводятся в Serial
+  - Форматированный вывод использует СТЕКОВЫЙ буфер (не фрагментирует кучу)
+  
+• В режиме RELEASE (DEBUG_LOG=0):
+  - ВСЕ макросы раскрываются в do{}while(0)
+  - Компилятор полностью удаляет код логирования
+  - Ни байта строк, ни вызовов функций не попадает в прошивку
+
+Использование:
+--------------
+• DBG_PRINT("text") — простой вывод
+• DBG_PRINTF("val=%d", x) — форматированный вывод (только в Debug!)
+• DBG_PRINTLN("") — вывод с переносом строки
+
+Важно:
+--------
+• Не добавлять '\n' в аргументы макросов — они добавляют его сами
+• В Release-сборке выражения внутри макросов НЕ вычисляются (экономия CPU)
+
+Автор: [Ваше имя/команда]
+Версия: 3.0
+Дата: 2026-04-22
+================================================================================
+*/
+
+#ifndef DEBUG_H
+#define DEBUG_H
+
+#include <Arduino.h>
+
+// ============================================================================
+// КОНФИГУРАЦИЯ: установить DEBUG_LOG=1 в platformio.ini для отладки
+// ============================================================================
+// Пример в platformio.ini:
+// build_flags = 
+//     -D DEBUG_LOG=1   ; для Debug-сборки
+//     -D DEBUG_LOG=0   ; для Release-сборки (по умолчанию)
+
+// ============================================================================
+// МАКРОСЫ ОТЛАДКИ
+// ============================================================================
+
+#if DEBUG_LOG
+    // ------------------------------------------------------------------------
+    // Debug-сборка: логи активны
+    // ------------------------------------------------------------------------
+    
+    /// Простой вывод строки
+    #define DBG_PRINT(msg)      Serial.print(msg)
+    
+    /// Вывод строки с переносом
+    #define DBG_PRINTLN(msg)    Serial.println(msg)
+    
+    /// Пустая строка (для разделения блоков лога)
+    #define DBG_NEWLINE()       Serial.println()
+    
+    /**
+     * @brief Форматированный вывод (аналог printf)
+     * 
+     * @details
+     * Использует буфер на СТЕКЕ (64 байта), чтобы не фрагментировать кучу.
+     * Автоматически добавляет '\n' в конце.
+     * 
+     * Пример: DBG_PRINTF("Heap: %u", ESP.getFreeHeap());
+     * 
+     * @warning Не использовать для строк > 64 символов — обрежется!
+     */
+    #define DBG_PRINTF(fmt, ...) do { \
+        char _dbg_buf[96]; \
+        snprintf(_dbg_buf, sizeof(_dbg_buf), fmt, ##__VA_ARGS__); \
+        Serial.println(_dbg_buf); \
+    } while(0)
+    
+#else
+    // ------------------------------------------------------------------------
+    // Release-сборка: ВСЕ логи исчезают на этапе препроцессора
+    // ------------------------------------------------------------------------
+    
+    #define DBG_PRINT(msg)      do {} while(0)
+    #define DBG_PRINTLN(msg)    do {} while(0)
+    #define DBG_NEWLINE()       do {} while(0)
+    #define DBG_PRINTF(fmt, ...) do {} while(0)
+    
+#endif // DEBUG_LOG
+
+#endif // DEBUG_H
+// END include/debug.h
+
+
+// START include/ProtocolManager.h
+// ======================================================================
+/*
+================================================================================
+PROTOCOLMANAGER.H — МЕНЕДЖЕР ПРОТОКОЛА
+================================================================================
+
+НАЗНАЧЕНИЕ:
+-----------
+Обрабатывает входящие JSON-сообщения и команды управления. Работает в отдельной
+задаче FreeRTOS.
+
+АРХИТЕКТУРА:
+------------
+• process() вызывает _readCommandQueue() и _readIncomingQueue()
+• Команды из _cmdQueue → onCommand(Command)
+• Сообщения из _inQueue → onMessage(const char*)
+• Ответы отправляются через _sendToBluetooth()
+
+================================================================================
+*/
+
+#ifndef PROTOCOL_MANAGER_H
+#define PROTOCOL_MANAGER_H
+
+#include "types.h"
+#include "BaseObject.h"
+#include <ArduinoJson.h>
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "debug.h"
+
+// ----------------------------------------------------------------------------
+// КОНФИГУРАЦИЯ
+// ----------------------------------------------------------------------------
+#define PROTOCOL_QUEUE_DEPTH   1       // Глубина очереди входящих сообщений
+#define PROTOCOL_TASK_STACK    4096    // Размер стека задачи
+#define PROTOCOL_TASK_PRIORITY 2       // Приоритет задачи
+
+// ----------------------------------------------------------------------------
+// ТИПЫ (временный callback, будет удалён)
+// ----------------------------------------------------------------------------
+typedef void (*ProtocolCommandCallback)(Command cmd, const char* payload);
+
+class ProtocolManager : public BaseObject {
+public:
+    // ========================================================================
+    // КОНСТРУКТОР / ДЕСТРУКТОР
+    // ========================================================================
+    
+    ProtocolManager(const char* name = "Protocol", 
+                    UBaseType_t priority = PROTOCOL_TASK_PRIORITY, 
+                    uint32_t stackSize = PROTOCOL_TASK_STACK, 
+                    BaseType_t core = 1);
+    ~ProtocolManager();
+
+    // ========================================================================
+    // УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ
+    // ========================================================================
+    
+    bool start() override;
+    void stop() override;
+
+    // ========================================================================
+    // ДОСТУП К ОЧЕРЕДЯМ (для BluetoothManager)
+    // ========================================================================
+    
+    QueueHandle_t getInQueue() const { return _inQueue; }
+    
+    // ========================================================================
+    // ОТПРАВКА ОТВЕТОВ
+    // ========================================================================
+    
+    void sendResponse(Command cmd, ResponseStatus status, const char* data = nullptr);
+    
+    // ========================================================================
+    // ВРЕМЕННЫЙ CALLBACK (будет удалён)
+    // ========================================================================
+    void setCommandCallback(ProtocolCommandCallback callback) { _cmdCallback = callback; }
+
+protected:
+    // ========================================================================
+    // ХУКИ БАЗОВОГО КЛАССА
+    // ========================================================================
+    
+    void process() override;                    // Главный цикл задачи
+    void onCommand(Command cmd) override;       // Обработчик команд из _cmdQueue
+    
+    // ========================================================================
+    // ОБРАБОТЧИК СООБЩЕНИЙ (симметрично onCommand)
+    // ========================================================================
+    
+    virtual void onMessage(const char* json);   // Обработчик входящих JSON-сообщений
+
+private:
+    // ========================================================================
+    // ОЧЕРЕДИ И СИНХРОНИЗАЦИЯ
+    // ========================================================================
+    
+    QueueHandle_t       _inQueue;       // Очередь входящих сообщений от Bluetooth
+    SemaphoreHandle_t   _jsonMutex;     // Мьютекс для защиты при копировании
+    
+    // ========================================================================
+    // ВРЕМЕННЫЙ CALLBACK
+    // ========================================================================
+    
+    ProtocolCommandCallback _cmdCallback;   // TODO: удалить после реализации onMessage
+    
+    // ========================================================================
+    // СТАТИСТИКА
+    // ========================================================================
+    
+    uint32_t _processedCount;   // Количество обработанных сообщений
+    uint32_t _errorCount;       // Количество ошибок
+    
+    // ========================================================================
+    // ВНУТРЕННИЕ МЕТОДЫ
+    // ========================================================================
+    
+    void _readIncomingQueue();              // Чтение _inQueue → onMessage()
+    void _sendToBluetooth(const char* json); // Отправка ответа в BluetoothManager
+    Command _stringToCommand(const char* str); // Преобразование строки в Command
+};
+
+#endif // PROTOCOL_MANAGER_H
+// END include/ProtocolManager.h
+
+
+// START include/types.h
+// ======================================================================
+/*
+================================================================================
+TYPES.H — ЕДИНЫЙ РЕЕСТР ТИПОВ СИСТЕМЫ
+================================================================================
+Файл: types.h
+Назначение:
+-----------
+Централизованное определение ВСЕХ типов, перечислений и констант.
+Этот файл ДОЛЖЕН подключаться ПЕРВЫМ в любом модуле, который использует
+системные типы.
+
+Порядок подключения (критично!):
+--------------------------------
+1. types.h
+2. Arduino.h / FreeRTOS headers
+3. Остальные заголовки
+
+Автор: [Ваше имя/команда]
+Версия: 3.0
+Дата: 2026-04-22
+================================================================================
+*/
+
+#ifndef SYSTEM_TYPES_H
+#define SYSTEM_TYPES_H
+
+#include <stdint.h>
+
+// ============================================================================
+// 1. СТАТУСЫ ОБЪЕКТОВ (используется в BaseObject)
+// ============================================================================
+enum class ObjectState : uint8_t {
+    STATE_STOPPED = 0,
+    STATE_RUNNING = 1,
+    STATE_ERROR   = 2
+};
+
+// ============================================================================
+// 2. КОМАНДЫ И СТАТУСЫ ОТВЕТОВ
+// ============================================================================
+enum Command : uint8_t {
+    CMD_NONE            = 0x00,  // Нет команды (пустышка, не используется)
+
+    // --- Управление trip/топливом (обрабатывает Calculator Task) ---
+    CMD_RESET_TRIP_A    = 0x01,  // Сброс trip_a и fuel_trip_a в 0
+    CMD_RESET_TRIP_B    = 0x02,  // Сброс trip_b и fuel_trip_b в 0
+    CMD_RESET_AVG       = 0x03,  // Сброс среднего расхода текущей поездки
+    CMD_FULL_TANK       = 0x04,  // Заправка: fuel_base = tank_capacity
+    CMD_CORRECT_ODO     = 0x05,  // Корректировка одометра (параметр: odo_value)
+
+    // --- Настройки (обрабатывает Protocol Task) ---
+    CMD_GET_CFG         = 0x06,  // Запрос всех настроек (ответ из кэша)
+    CMD_SET_CFG         = 0x07,  // Установка настроек (параметры в set_cfg)
+
+    // --- К-Line диагностика (обрабатывает K-Line Task) ---
+    CMD_KL_GET_DTC      = 0x08,  // Чтение кодов ошибок ЭБУ
+    CMD_KL_CLEAR_DTC    = 0x09,  // Сброс кодов ошибок ЭБУ
+    CMD_KL_RESET_ADAPT  = 0x0A,  // Сброс адаптации АКПП (TCM)
+    CMD_KL_PUMP_ATF     = 0x0B,  // Прокачка жидкости АКПП
+    CMD_KL_DETECT_PROTO = 0x0C,   // Принудительное автоопределение протокола
+
+    // --- Калибровка (обрабатывает RealEngine Task) ---
+    CMD_CALIBRATE_SPEED     = 0x0D,  // Калибровка VSS (расстояние → pulses_per_meter)
+    CMD_CALIBRATE_INJECTOR  = 0x0E,  // Калибровка форсунки (реальный расход → injector_flow)
+    CMD_CALIBRATE_DEADTIME  = 0x0F,  // Калибровка dead time (расход на холостых → dead_time_us)
+
+    // --- OTA (обрабатывают все задачи) ---
+    CMD_OTA_START           = 0x11,  // Начало OTA: все задачи завершаются (освобождение памяти)
+    CMD_OTA_END             = 0x10,  // Завершение OTA: Update.end() → ESP.restart()
+};
+
+struct CommandMap {
+    const char* str;
+    Command cmd;
+};
+
+static const CommandMap COMMAND_TABLE[] = {
+    {"get_cfg",   Command::CMD_GET_CFG},
+    {"set_cfg", Command::CMD_SET_CFG},
+    {"reset_trip_a", Command::CMD_RESET_TRIP_A},
+    {"reset_trip_b", Command::CMD_RESET_TRIP_B},
+    {"reset_avg", Command::CMD_RESET_AVG},
+    {"full_tank", Command::CMD_FULL_TANK},
+    {"kl_get_dtc", Command::CMD_KL_GET_DTC},
+    {"kl_clear_dtc", Command::CMD_KL_CLEAR_DTC},
+    {"kl_reset_adapt", Command::CMD_KL_RESET_ADAPT},
+    {"kl_pump_atf", Command::CMD_KL_PUMP_ATF},
+    {"kl_detect_protocol", Command::CMD_KL_DETECT_PROTO},
+    {"calibrate_speed_start", Command::CMD_CALIBRATE_SPEED},        
+    {"ota_update",   Command::CMD_OTA_END}
+};
+
+enum class ResponseStatus : uint8_t {
+    STATUS_OK       = 0x00,
+    STATUS_ERROR    = 0x01
+};
+
+// ============================================================================
+// 3. КОНСТАНТЫ ОЧЕРЕДЕЙ (используется в BaseObject)
+// ============================================================================
+#define BASE_CMD_QUEUE_DEPTH     5
+#define BASE_CMD_TYPE            uint8_t
+
+// ============================================================================
+// 4. СТРУКТУРЫ СООБЩЕНИЙ (общие для модулей)
+// ============================================================================
+
+/**
+ * @brief Сообщение для исходящей очереди Bluetooth.
+ * @details Владеет очередью BluetoothManager.
+ */
+struct BtOutMessage {
+    uint16_t len;
+    char     data[512];
+};
+
+/**
+ * @brief Сообщение для входящей очереди протокола.
+ * @details Владеет очередью ProtocolManager.
+ */
+struct ProtocolInMessage {
+    uint16_t len;
+    char     payload[128];
+};
+
+#endif // SYSTEM_TYPES_H
+// END include/types.h
+
