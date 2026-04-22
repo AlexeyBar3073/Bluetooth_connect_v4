@@ -1,9 +1,5 @@
 #include "DataRouter.h"
 
-QueueHandle_t DataRouter::_incomingQueue = nullptr;
-QueueHandle_t DataRouter::_outgoingQueue = nullptr;
-QueueHandle_t DataRouter::_commandQueue  = nullptr;
-
 void DataRouter::init() {
     _incomingQueue = nullptr;
     _outgoingQueue = nullptr;
@@ -21,7 +17,6 @@ void DataRouter::registerQueue(Topic topic, QueueHandle_t queue) {
 bool DataRouter::publish(Topic topic, const void* data) {
     QueueHandle_t target = nullptr;
     size_t size = 0;
-
     switch (topic) {
         case Topic::MSG_INCOMING:
             target = _incomingQueue;
@@ -36,7 +31,6 @@ bool DataRouter::publish(Topic topic, const void* data) {
             size = sizeof(Command);
             break;
     }
-
     if (target && data) {
         // Используем xQueueSend. Для команд и сообщений обычно хватает 0 ожидания.
         return xQueueSend(target, data, 0) == pdTRUE;

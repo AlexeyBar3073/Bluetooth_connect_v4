@@ -1,26 +1,29 @@
+/*
+================================================================================
+DATA_ROUTER.H — СТАТИЧЕСКИЙ МАРШРУТИЗАТОР СООБЩЕНИЙ
+================================================================================
+Реализует интерфейс IRouter для маршрутизации сообщений между задачами.
+================================================================================
+*/
 #ifndef DATA_ROUTER_H
 #define DATA_ROUTER_H
 
-#include "types.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "IRouter.h"
 #include "debug.h"
 
-class DataRouter {
+class DataRouter : public IRouter {
 public:
     // Инициализация (сброс указателей)
-    static void init();
-
-    // Регистрация очереди для конкретного топика
-    static void registerQueue(Topic topic, QueueHandle_t queue);
-
-    // Публикация данных в топик
-    static bool publish(Topic topic, const void* data);
+    void init();
+    // Регистрация очереди для конкретного топика (из IRouter)
+    void registerQueue(Topic topic, QueueHandle_t queue) override;
+    // Публикация данных в топик (из IRouter)
+    bool publish(Topic topic, const void* data) override;
 
 private:
-    static QueueHandle_t _incomingQueue;
-    static QueueHandle_t _outgoingQueue;
-    static QueueHandle_t _commandQueue;
+    QueueHandle_t _incomingQueue = nullptr;
+    QueueHandle_t _outgoingQueue = nullptr;
+    QueueHandle_t _commandQueue  = nullptr;
 };
 
-#endif
+#endif // DATA_ROUTER_H

@@ -1,6 +1,6 @@
 // ======================================================================
 // Собранный проект: Bluetooth_connect_v2
-// Дата сборки: D:\VS_Code_project\Bluetooth_connect_v4
+// Дата сборки: C:\Users\Алексей\Documents\PlatformIO\Projects\Bluetooth_connect_v4
 // ======================================================================
 
 // START platformio.ini
@@ -224,10 +224,8 @@ BLUETOOTHMANAGER.CPP — РЕАЛИЗАЦИЯ МЕНЕДЖЕРА BLUETOOTH
 */
 
 #include "BluetoothManager.h"
-#include "ProtocolManager.h"   // <-- ДОБАВИТЬ ПОЛНЫЙ ЗАГОЛОВОК!
+#include "DataRouter.h"
 
-// Внешняя ссылка на ProtocolManager (определён в main.cpp)
-extern ProtocolManager protocol;
 
 // ============================================================================
 // КОНСТРУКТОР / ДЕСТРУКТОР
@@ -299,21 +297,17 @@ void BluetoothManager::stop() {
 // ============================================================================
 
 void BluetoothManager::sendToProtocol(const char* json) {
-    // В будущем: DataRouter::publish(TOPIC_MSG_INCOMING, json)
-    // Пока — прямой вызов ProtocolManager
-    QueueHandle_t targetQueue = protocol.getInQueue();
-    if (!targetQueue) return;
-    
     ProtocolInMessage msg;
     uint16_t len = strlen(json);
-    if (len >= sizeof(msg.payload)) {
-        len = sizeof(msg.payload) - 1;
-    }
+    if (len >= sizeof(msg.payload)) len = sizeof(msg.payload) - 1;
+    
     msg.len = len;
     memcpy(msg.payload, json, len);
     msg.payload[len] = '\0';
     
-    xQueueOverwrite(targetQueue, &msg);
+    if (!DataRouter::publish(Topic::MSG_INCOMING, &msg)) {
+        // DBG_PRINTLN("[BT] Error: Router rejected incoming msg");
+    }
 }
 
 // ============================================================================
@@ -434,6 +428,56 @@ void BluetoothManager::_setLed(bool state) {
 // END src/BluetoothManager.cpp
 
 
+// START src/DataRouter.cpp
+// ======================================================================
+#include "DataRouter.h"
+
+QueueHandle_t DataRouter::_incomingQueue = nullptr;
+QueueHandle_t DataRouter::_outgoingQueue = nullptr;
+QueueHandle_t DataRouter::_commandQueue  = nullptr;
+
+void DataRouter::init() {
+    _incomingQueue = nullptr;
+    _outgoingQueue = nullptr;
+    _commandQueue  = nullptr;
+}
+
+void DataRouter::registerQueue(Topic topic, QueueHandle_t queue) {
+    switch (topic) {
+        case Topic::MSG_INCOMING: _incomingQueue = queue; break;
+        case Topic::MSG_OUTGOING: _outgoingQueue = queue; break;
+        case Topic::SYSTEM_CMD:   _commandQueue  = queue; break;
+    }
+}
+
+bool DataRouter::publish(Topic topic, const void* data) {
+    QueueHandle_t target = nullptr;
+    size_t size = 0;
+
+    switch (topic) {
+        case Topic::MSG_INCOMING:
+            target = _incomingQueue;
+            size = sizeof(ProtocolInMessage);
+            break;
+        case Topic::MSG_OUTGOING:
+            target = _outgoingQueue;
+            size = sizeof(BtOutMessage);
+            break;
+        case Topic::SYSTEM_CMD:
+            target = _commandQueue;
+            size = sizeof(Command);
+            break;
+    }
+
+    if (target && data) {
+        // Используем xQueueSend. Для команд и сообщений обычно хватает 0 ожидания.
+        return xQueueSend(target, data, 0) == pdTRUE;
+    }
+    return false;
+}
+// END src/DataRouter.cpp
+
+
 // START src/main.cpp
 // ======================================================================
 /*
@@ -452,6 +496,7 @@ MAIN.CPP — ТОЧКА ВХОДА
 #include <Arduino.h>
 #include "types.h"
 #include "debug.h"
+#include "DataRouter.h"
 #include "BluetoothManager.h"
 #include "ProtocolManager.h"
 
@@ -461,29 +506,6 @@ MAIN.CPP — ТОЧКА ВХОДА
 
 BluetoothManager bt;
 ProtocolManager protocol;
-
-// ============================================================================
-// ОБРАБОТЧИК КОМАНД
-// ============================================================================
-
-void onCommandReceived(Command cmd, const char* payload) {
-    DBG_PRINTF("[APP] Cmd: 0x%02X", static_cast<uint8_t>(cmd));
-    
-    switch (cmd) {
-        case Command::CMD_NONE:
-            protocol.sendResponse(cmd, ResponseStatus::STATUS_ERROR, "invalid");
-            break;
-            
-        case Command::CMD_GET_CFG:
-            DBG_PRINTLN("[APP] Config requested");
-            protocol.sendResponse(cmd, ResponseStatus::STATUS_OK, "{\"tank\":50}");
-            break;
-            
-        default:
-            protocol.sendResponse(cmd, ResponseStatus::STATUS_OK, "ok");
-            break;
-    }
-}
 
 // ============================================================================
 // SETUP
@@ -509,10 +531,13 @@ void setup() {
         DBG_PRINTLN("[MAIN] CRITICAL: Protocol start failed");
         while (true) { delay(1000); }
     }
-
-    // Установка callback для обработки команд
-    protocol.setCommandCallback(onCommandReceived);
     
+    // 3. Регистрация очередей в роутере
+    DataRouter::registerQueue(Topic::MSG_INCOMING, protocol.getInQueue());
+    DataRouter::registerQueue(Topic::MSG_OUTGOING, bt.getOutQueue());
+    // Очередь системных команд (например, очередь самого протокола или отдельная)
+    DataRouter::registerQueue(Topic::SYSTEM_CMD, protocol.getCommandQueue());
+
     DBG_NEWLINE();
     DBG_PRINTLN("=== System READY ===");
     DBG_PRINTF("Free Heap: %u bytes", ESP.getFreeHeap());
@@ -545,10 +570,8 @@ PROTOCOLMANAGER.CPP — РЕАЛИЗАЦИЯ МЕНЕДЖЕРА ПРОТОКОЛ
 */
 
 #include "ProtocolManager.h"
-#include "BluetoothManager.h"
+#include "DataRouter.h"
 
-// Внешняя ссылка на BluetoothManager (определён в main.cpp)
-extern BluetoothManager bt;
 
 // ============================================================================
 // КОНСТРУКТОР / ДЕСТРУКТОР
@@ -645,17 +668,13 @@ void ProtocolManager::sendResponse(Command cmd, ResponseStatus status, const cha
 // ============================================================================
 
 void ProtocolManager::process() {
-    _readIncomingQueue();   // Сообщения от Bluetooth
+    //--- Обработка очереди входящих сообщений
+    _readIncomingQueue(); 
 }
 
+//--- Обработчик команд
 void ProtocolManager::onCommand(Command cmd) {
-    DBG_PRINTF("[PROTOCOL] Command: 0x%02X", static_cast<uint8_t>(cmd));
-    
-    // В будущем — полноценная обработка команд
-    // Пока пробрасываем в старый callback для совместимости
-    if (_cmdCallback) {
-        _cmdCallback(cmd, nullptr);
-    }
+   
 }
 
 // ============================================================================
@@ -728,20 +747,15 @@ void ProtocolManager::_readIncomingQueue() {
 }
 
 void ProtocolManager::_sendToBluetooth(const char* json) {
-    QueueHandle_t targetQueue = bt.getOutQueue();
-    if (!targetQueue) return;
-    
     BtOutMessage msg;
     uint16_t len = strlen(json);
-    if (len >= sizeof(msg.data)) {
-        len = sizeof(msg.data) - 1;
-        DBG_PRINTLN("[PROTOCOL] WARNING: Response truncated");
-    }
+    if (len >= sizeof(msg.data)) len = sizeof(msg.data) - 1;
+    
     msg.len = len;
     memcpy(msg.data, json, len);
     msg.data[len] = '\0';
     
-    xQueueOverwrite(targetQueue, &msg);
+    DataRouter::publish(Topic::MSG_OUTGOING, &msg);
 }
 
 Command ProtocolManager::_stringToCommand(const char* str) {
@@ -1053,6 +1067,37 @@ private:
 // END include/BluetoothManager.h
 
 
+// START include/DataRouter.h
+// ======================================================================
+#ifndef DATA_ROUTER_H
+#define DATA_ROUTER_H
+
+#include "types.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "debug.h"
+
+class DataRouter {
+public:
+    // Инициализация (сброс указателей)
+    static void init();
+
+    // Регистрация очереди для конкретного топика
+    static void registerQueue(Topic topic, QueueHandle_t queue);
+
+    // Публикация данных в топик
+    static bool publish(Topic topic, const void* data);
+
+private:
+    static QueueHandle_t _incomingQueue;
+    static QueueHandle_t _outgoingQueue;
+    static QueueHandle_t _commandQueue;
+};
+
+#endif
+// END include/DataRouter.h
+
+
 // START include/debug.h
 // ======================================================================
 /*
@@ -1323,6 +1368,12 @@ enum class ObjectState : uint8_t {
     STATE_STOPPED = 0,
     STATE_RUNNING = 1,
     STATE_ERROR   = 2
+};
+
+enum class Topic : uint8_t {
+    MSG_INCOMING,   // Входящие JSON строки (BT -> Protocol)
+    MSG_OUTGOING,   // Исходящие JSON строки (Protocol -> BT)
+    SYSTEM_CMD      // Системные команды (Command enum)
 };
 
 // ============================================================================
